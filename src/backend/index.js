@@ -11,9 +11,11 @@ function loadConfig(env = process.env) {
     return value;
   };
   const modelBaseUrl = env.BACKEND_MODEL_BASE_URL || '';
-  if (modelBaseUrl) {
-    const url = new URL(modelBaseUrl);
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Invalid BACKEND_MODEL_BASE_URL');
+  const asrBaseUrl = env.BACKEND_ASR_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+  for (const [name, value] of [['BACKEND_MODEL_BASE_URL', modelBaseUrl], ['BACKEND_ASR_BASE_URL', asrBaseUrl]]) {
+    if (!value) continue;
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error(`Invalid ${name}`);
   }
   const deviceId = env.BACKEND_DEVICE_ID || 'typewriter';
   if (!/^[a-zA-Z0-9_-]{1,128}$/.test(deviceId)) throw new Error('Invalid BACKEND_DEVICE_ID');
@@ -29,6 +31,10 @@ function loadConfig(env = process.env) {
     dataDir: path.resolve(env.BACKEND_DATA_DIR || '.backend-data'), origins,
     heartbeatMs, offlineMs, typingIdleMs: number('BACKEND_TYPING_IDLE_MS', 3000, 100, 60000),
     modelTimeoutMs: number('BACKEND_MODEL_TIMEOUT_MS', 120000, 100, 600000),
+    asrBaseUrl, asrModel: env.BACKEND_ASR_MODEL || 'qwen3-asr-flash',
+    asrApiKey: env.BACKEND_ASR_API_KEY || env.DASHSCOPE_API_KEY || '',
+    asrLanguage: env.BACKEND_ASR_LANGUAGE || '',
+    asrTimeoutMs: number('BACKEND_ASR_TIMEOUT_MS', 60000, 100, 120000),
   };
 }
 

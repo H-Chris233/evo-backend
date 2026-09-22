@@ -3,6 +3,7 @@
 const http = require('node:http');
 const { timingSafeEqual } = require('node:crypto');
 const { Backend, httpError, requireId } = require('./service');
+const { readAudio, transcribeAudio, asrError } = require('./asr');
 
 function sameToken(value, expected) {
   const a = Buffer.from(value || '');
@@ -38,10 +39,13 @@ function send(res, status, body) {
 function createBackendServer(config) {
   if (!config.webToken || !config.deviceToken || config.webToken === config.deviceToken) throw new Error('Distinct BACKEND_WEB_TOKEN and BACKEND_DEVICE_TOKEN are required');
   const backend = new Backend(config);
+  let asrController = null;
+  let asrWork = null;
   const server = http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     handle(req, res).catch(error => {
       if (res.headersSent) return res.destroy();
-      if (error.status === 413) res.setHeader('Connection', 'close');
+      // Discard rejected upload bytes without buffering. A mid-upload socket close can hide the HTTP error.
+      req.resume();
       send(res, error.status || 500, { error: { code: error.status ? error.code : 'INTERNAL_ERROR', message: error.status ? error.message : 'Backend request failed' } });
     });
   });
@@ -70,6 +74,25 @@ function createBackendServer(config) {
     const route = parts.slice(2);
     const webOnly = () => { if (role !== 'web') throw httpError(403, 'FORBIDDEN', 'Web access token required'); };
     const deviceOnly = () => { if (role !== 'device') throw httpError(403, 'FORBIDDEN', 'Device access token required'); };
+    if (route.length === 2 && route[0] === 'audio' && route[1] === 'transcriptions' && req.method === 'POST') {
+      webOnly();
+      if (!config.asrApiKey) throw asrError(503, 'ASR_NOT_CONFIGURED', 'Speech recognition is not configured');
+      if (backend.active) throw asrError(409, 'AGENT_BUSY', 'Wait for the current reply before transcribing');
+      if (asrController) throw asrError(409, 'ASR_BUSY', 'A transcription is already running');
+      const controller = new AbortController();
+      asrController = controller;
+      const abort = () => controller.abort(asrError(499, 'ASR_CANCELLED', 'Transcription cancelled'));
+      res.on('close', abort);
+      const timer = setTimeout(() => controller.abort(asrError(504, 'ASR_TIMEOUT', 'Speech recognition timed out')), config.asrTimeoutMs);
+      try {
+        // Audio is kept only for this request; neither recordings nor drafts enter the conversation store.
+        asrWork = (async () => transcribeAudio(config, await readAudio(req, controller.signal), controller.signal))();
+        return send(res, 200, await asrWork);
+      } finally {
+        clearTimeout(timer); res.removeListener('close', abort);
+        asrController = null; asrWork = null;
+      }
+    }
     if (route.length === 1 && route[0] === 'status' && req.method === 'GET') {
       webOnly(); return send(res, 200, backend.status());
     }
@@ -130,6 +153,8 @@ function createBackendServer(config) {
     },
     async close() {
       const closed = new Promise(resolve => server.close(resolve));
+      asrController?.abort(asrError(503, 'ASR_CANCELLED', 'Backend stopped'));
+      await asrWork?.catch(() => {});
       await backend.close();
       server.closeAllConnections();
       await closed;

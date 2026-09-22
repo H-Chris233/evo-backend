@@ -82,6 +82,7 @@ class Backend {
   status() {
     return {
       model: { ...this.modelHealth },
+      asr: { configured: !!this.config.asrApiKey, model: this.config.asrModel || 'qwen3-asr-flash' },
       active_request: this.active ? { session_id: this.active.sessionId, request_id: this.active.requestId, state: this.active.state } : null,
       device: this.deviceSnapshot(),
     };

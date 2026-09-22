@@ -172,4 +172,4 @@ async function runAgent({ config, history, text, source, printConstraints, signa
   }
 }
 
-module.exports = { runAgent, sseData, failure };
+module.exports = { runAgent, sseData, failure, readLimited };
