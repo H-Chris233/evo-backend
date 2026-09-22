@@ -1,4 +1,5 @@
 node_modules/
+.backend-data/
 .env
 # This repo is npm-canonical: only package-lock.json is tracked. A stray
 # pnpm-lock.yaml from a local `pnpm install` would diverge from CI's npm
