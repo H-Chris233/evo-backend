@@ -24,6 +24,7 @@ class BoardConnection {
     this.inflight = null; this.connectionId = null; this.stopping = false; this.worker = null;
     this.lastError = null; this.nextConnect = 0; this.timer = null; this.controller = new AbortController();
     this.lastStateLog = '';
+    this.stopVersion = 0;
     backend.store.data.board_inputs ||= [];
   }
   snapshot() {
@@ -58,7 +59,8 @@ class BoardConnection {
         if (typeof event.data !== 'string' || event.data.length > 1048576) throw new Error('Invalid message');
         const message = JSON.parse(event.data);
         if (message.v !== 1) throw new Error('Invalid version');
-        if (message.type === 'state') this.remote = message.state;
+        if (message.type === 'state') { this.remote = message.state; this.stopped(message.state.last_stop_id); }
+        else if (message.type === 'input.cancelled') this.stopped(message.stop_id);
         else if (message.type === 'input.submitted') this.input(message);
         else if (message.type === 'response.drained') this.delivered(message.request_id);
         else if (['error', 'device.error'].includes(message.type)) this.fail('BOARD_DEVICE_ERROR', { board_request_id: message.request_id, device_error: message.error });
@@ -92,6 +94,15 @@ class BoardConnection {
   send(message) {
     if (this.ws?.readyState !== WebSocket.OPEN) throw new Error('Board WebSocket is unavailable');
     this.ws.send(JSON.stringify({ v: 1, ...message }));
+  }
+  stopped(stopId) {
+    if (!validId(stopId)) return;
+    if (this.backend.store.data.board_stop_id !== stopId) {
+      this.stopVersion++; this.inflight = null;
+      this.backend.store.data.board_stop_id = stopId;
+      this.backend.stop();
+    }
+    if (this.ws?.readyState === WebSocket.OPEN) this.send({ type: 'stop.ack', stop_id: stopId });
   }
   end(requestId) {
     const input = this.backend.store.data.board_inputs.find(item => item.id === requestId);
@@ -129,7 +140,12 @@ class BoardConnection {
   }
   async run() {
     this.socket();
-    const state = await this.http('/state'); this.remote = state;
+    const stopVersion = this.stopVersion;
+    const state = await this.http('/state');
+    if (stopVersion !== this.stopVersion) return;
+    this.remote = state;
+    this.stopped(state.last_stop_id);
+    if (stopVersion !== this.stopVersion) return;
     const stateKey = JSON.stringify([state.connected, state.state, state.active_request, state.last_error]);
     if (stateKey !== this.lastStateLog) {
       this.lastStateLog = stateKey;
@@ -147,9 +163,16 @@ class BoardConnection {
     this.backend.device.lastSeen = Date.now(); this.lastError = null;
     if (state.last_delivery?.status === 'drained') this.delivered(state.last_delivery.request_id);
     const data = this.backend.store.data;
-    if (!this.backend.active && this.backend.modelReady()) {
+    if (!this.backend.active) {
       const input = data.board_inputs.find(item => item.status === 'pending');
-      if (input) {
+      if (input?.text.trim() === '/new') {
+        this.inflight = null;
+        this.backend.stop('Started a new conversation');
+        const session = this.backend.createSession('typewriter');
+        input.status = 'session_reset'; input.session_id = session.id; input.response_ended = false; this.backend.store.save();
+        this.backend.publishDevice();
+        log('board.session_reset', { board_request_id: input.id, session_id: session.id });
+      } else if (input && this.backend.modelReady()) {
         const session = this.backend.session(this.backend.device.sessionId);
         const accepted = this.backend.submit(session, { text: input.text, client_message_id: input.id }, { requestId: input.id, localEcho: true });
         input.status = 'submitted'; input.request_id = accepted.request_id; this.backend.store.save();
@@ -158,6 +181,12 @@ class BoardConnection {
     }
     const head = this.backend.printing.head();
     const input = data.board_inputs.find(item => item.id === state.active_request);
+    if (input?.status === 'session_reset') {
+      // Replaying this fixed sequence/end is safe until the host reports drain, including after reconnect.
+      this.send({ type: 'response.delta', request_id: input.id, seq: 0, text: 'NEW CONVERSATION.\n\r' });
+      this.send({ type: 'response.end', request_id: input.id });
+      return;
+    }
     const request = head && data.sessions.find(s => s.id === head.session_id)?.requests.find(r => r.id === head.request_id);
     // Release a keyboard lock while an earlier round or a prolonged model retry is ahead of it.
     if (input && !input.response_ended && !this.inflight &&
@@ -202,6 +231,7 @@ class BoardConnection {
       }
       log('board.output_sent', { job_id: job.id, board_request_id: remoteId, bytes: text.length, awaiting: 'software_drain' });
     } catch (error) {
+      if (job.status === 'abandoned') return;
       if (error.boardError === 'busy') {
         log('board.busy', { job_id: job.id, board_request_id: remoteId }, 'warn');
         this.inflight = null; job.status = 'pending'; this.backend.printing.changed(job);

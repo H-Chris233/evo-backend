@@ -28,7 +28,7 @@ class Store {
       || this.data.print_segments.some(segment => !Array.isArray(segment.job_ids)
         || !['waiting_reply', 'pending', 'translating', 'retrying', 'ready', 'completed'].includes(segment.status)
         || !['you', 'them'].includes(segment.role) || !Number.isSafeInteger(segment.turn_number)
-        || segment.turn_number < 1 || segment.turn_number >= this.data.next_turn
+        || segment.turn_number < 1
         || !Number.isSafeInteger(segment.attempts) || segment.attempts < 0
         || (segment.next_retry_at !== null && !Number.isFinite(Date.parse(segment.next_retry_at)))
         || (['ready', 'completed'].includes(segment.status) && !segment.local_echo && (typeof segment.translation !== 'string'

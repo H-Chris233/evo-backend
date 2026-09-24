@@ -151,6 +151,19 @@ test('web and typewriter retain isolated original history while both print exact
   assert.equal((await f.input(device.connection_id, 'changed', messageId)).status, 409);
 });
 
+test('new conversation resets TURN without merging pending rounds that share the same number', async t => {
+  const f = await fixture(t);
+  const first = await f.session(), device = await f.connect();
+  await f.submit(first, 'Old conversation'); await f.done(first);
+  const second = await f.session();
+  assert.equal(f.app.backend.store.data.next_turn, 1);
+  await f.submit(second, 'New conversation'); await f.done(second);
+  assert.equal(f.app.backend.printing.summary().pending_turns, 2);
+  const printed = await f.drain(device.connection_id);
+  assert.deepEqual(printed.map(item => item.turn_number), [1, 1, 1, 1]);
+  assert.equal(f.requests.at(-1).messages.filter(message => message.role === 'user').length, 1);
+});
+
 test('backend persona is mandatory on both channels and subsequent turns, but excluded from translation', async t => {
   const skill = fs.readFileSync(path.join(__dirname, '../skills/steve-jobs-skill/SKILL.md'), 'utf8');
   const f = await fixture(t);
@@ -172,6 +185,8 @@ test('backend persona is mandatory on both channels and subsequent turns, but ex
     assert.match(request.messages[0].content, /用户没要建议，就不自动开药方/);
     assert.match(request.messages[0].content, /我知道自己已经在 2011 年去世/);
     assert.match(request.messages[0].content, /我正通过一台打字机与眼前的用户交谈/);
+    assert.match(request.messages[0].content, /最多 80 字；英文最多 40 个词/);
+    assert.match(request.messages[0].content, /只有用户明确要求详细解释、完整故事或步骤时才展开/);
     assert.doesNotMatch(request.messages[0].content, /要点永远压缩到三个|先给一句话判断（amazing还是shit）|That's a stupid question|沉默10秒后/);
     assert.doesNotMatch(request.messages[0].content, /Give the skill's roleplay disclosure|首次激活时输出免责声明|我以乔布斯视角和你聊|Skill 的免责声明在最上面/);
     assert.equal(request.messages[0].content, f.requests[0].messages[0].content);
@@ -247,7 +262,7 @@ test('partial, truncated and failed answers print an honest marker, never the pa
       assert.equal(JSON.stringify(session).includes('model-secret'), false);
       if (['partial', 'length'].includes(mode)) assert.equal(session.messages.at(-1).status, 'incomplete');
       const paper = (await f.drain(device.connection_id)).map(c => c.text).join('');
-      assert.equal(paper, 'TURN 0001\nYOU:\nhello\n\nTHEM:\n[Reply unavailable.]\n\n');
+      assert.equal(paper, 'TURN 0001\nYOU:\nhello\n\nTHEY:\n[Reply unavailable.]\n\n');
     });
   }
 });
@@ -267,7 +282,7 @@ test('non-streaming original answers stay intact while English print text is spl
       assert.ok(!session.requests[0].activities.some(a => a.state === 'typing'));
       const commands = await f.drain(device.connection_id);
       assert.ok(commands.every(c => c.text.length <= (text === 'too long' ? 3 : 100) && !c.text.includes('\n')));
-      assert.equal(commands.map(c => c.text).join(''), `TURN 0001 YOU: hello  THEM: ${text === '中文' ? 'English translation.' : text.replace(/\n/g, ' ')}  `);
+      assert.equal(commands.map(c => c.text).join(''), `TURN 0001 YOU: hello  THEY: ${text === '中文' ? 'English translation.' : text.replace(/\n/g, ' ')}  `);
     });
   }
 });
@@ -567,6 +582,33 @@ test('translation retries with capped backoff indefinitely while chat continues 
   assert.equal(f.translations.length, 6);
 });
 
+test('stop abandons dispatched and waiting prints, aborts model and translation, and stays empty after restart', async t => {
+  let lateReply, lateTranslation;
+  const f = await fixture(t, (body, res, count) => {
+    if (count === 1) completion(res);
+    else lateReply = () => completion(res, 'Late reply');
+  }, { translationHandler(body, res, count) {
+    const finish = () => res.end(JSON.stringify({ choices: [{ message: { content: 'English' }, finish_reason: 'stop' }] }));
+    if (count <= 2) finish(); else lateTranslation = finish;
+  } });
+  const session = await f.session(), device = await f.connect();
+  await f.submit(session, 'First'); await f.done(session);
+  const command = (await f.command(device.connection_id)).data;
+  await f.submit(session, 'Second');
+  await eventually(() => lateReply && lateTranslation);
+  f.app.backend.stop();
+  await eventually(() => !f.app.backend.active && !f.app.backend.printing.worker);
+  lateReply(); lateTranslation();
+  assert.equal(f.app.backend.store.data.jobs[0].status, 'abandoned');
+  assert.equal(f.app.backend.printing.summary().pending_segments, 0);
+  assert.equal((await f.command(device.connection_id)).status, 204);
+  assert.equal((await f.receipt(device.connection_id, command.job_id, 'completed')).data.status, 'abandoned');
+  assert.equal(f.app.backend.session(session).messages[0].text, 'First');
+  await f.restart();
+  assert.equal(f.app.backend.printing.summary().pending_segments, 0);
+  assert.equal(f.app.backend.session(session).requests.at(-1).error.code, 'CANCELLED');
+});
+
 test('invalid, non-ASCII and incomplete translations remain queued for retry instead of reaching paper', async t => {
   for (const mode of ['empty', 'unicode', 'truncated', 'tools', 'invalid']) await t.test(mode, async t => {
     const f = await fixture(t, undefined, { translationHandler(body, res) {
@@ -600,7 +642,7 @@ test('offline translations survive restart and unissued chunks resume without re
   const reconnected = await f.connect({ ...capabilities, max_chars: 8 });
   const rest = await f.drain(reconnected.connection_id);
   assert.equal(rest[0].part_index, 2);
-  assert.equal([first, ...rest].map(c => c.text).join(''), 'TURN 0001\nYOU:\nlong original input\n\nTHEM:\nHello from the agent.\n\n');
+  assert.equal([first, ...rest].map(c => c.text).join(''), 'TURN 0001\nYOU:\nlong original input\n\nTHEY:\nHello from the agent.\n\n');
   assert.equal(f.translations.length, 2);
   assert.equal(f.app.backend.printing.summary().pending_turns, 0);
 });
@@ -667,7 +709,7 @@ test('crash recovery resumes a translating input and closes its interrupted answ
   assert.equal(f.app.backend.session(session).requests[0].status, 'interrupted');
   const device = await f.connect();
   const paper = (await f.drain(device.connection_id)).map(c => c.text).join('');
-  assert.equal(paper, 'TURN 0001\nYOU:\nrecover me\n\nTHEM:\n[Reply unavailable.]\n\n');
+  assert.equal(paper, 'TURN 0001\nYOU:\nrecover me\n\nTHEY:\n[Reply unavailable.]\n\n');
   assert.equal(f.translations.length, 3);
 });
 

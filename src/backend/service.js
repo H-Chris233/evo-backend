@@ -51,8 +51,10 @@ class Backend {
   createSession(source = 'web') {
     this.ready();
     const session = { id: id(), source, created_at: now(), messages: [], requests: [] };
+    if (this.store.data.sessions.some(s => s.source === source)) this.store.data.next_turn = 1;
     this.store.data.sessions.push(session);
     this.store.save();
+    if (source === 'typewriter') this.device.sessionId = session.id;
     log('session.created', { session_id: session.id, source });
     return session;
   }
@@ -66,7 +68,7 @@ class Backend {
   deviceSnapshot() {
     const device = this.device;
     const job = this.job();
-    const session = this.store.data.sessions.find(s => s.source === 'typewriter');
+    const session = this.store.data.sessions.findLast(s => s.source === 'typewriter');
     const request = session?.requests.at(-1);
     let business = 'idle';
     if (device.connection === 'connected') {
@@ -123,7 +125,7 @@ class Backend {
     normalized.charset = caps.charset || null;
     normalized.max_chars = caps.max_chars || null;
     this.loseConnection();
-    let session = this.store.data.sessions.find(s => s.source === 'typewriter');
+    let session = this.store.data.sessions.findLast(s => s.source === 'typewriter');
     if (!session) session = this.createSession('typewriter');
     this.device = {
       id: this.config.deviceId, connection: 'connected', connectionId: id(), lastSeen: Date.now(),
@@ -333,6 +335,18 @@ class Backend {
       this.publishDevice();
       this.printing.wake();
     }
+  }
+
+  stop(reason = 'Stopped by Escape') {
+    this.ready();
+    log('queue.stopped', { request_id: this.active?.requestId, pending_segments: this.printing.summary().pending_segments });
+    this.active?.controller.abort(failure('CANCELLED', reason));
+    for (const input of this.store.data.board_inputs || []) {
+      if (['pending', 'submitted', 'session_reset'].includes(input.status)) {
+        input.status = 'cancelled'; input.response_ended = true;
+      }
+    }
+    this.printing.clear(reason);
   }
 
   printAvailable() { return this.printing.available(); }

@@ -65,7 +65,7 @@ class PrintQueue {
     }
     const reference = item => item ? { turn_number: item.turn_number, role: item.role } : null;
     return {
-      state: this.fault || this.store.failed ? 'error' : state, pending_turns: new Set(pending.map(s => s.turn_number)).size, pending_segments: pending.length,
+      state: this.fault || this.store.failed ? 'error' : state, pending_turns: new Set(pending.map(s => s.request_id)).size, pending_segments: pending.length,
       head: reference(head),
       translation: translation ? { ...reference(translation), state: translation.status, attempts: translation.attempts, next_retry_at: translation.next_retry_at, error: translation.error } : null,
       current_job: job ? { ...reference(job), id: job.id, status: job.status, part_index: job.part_index, part_count: job.part_count, error: job.error } : null,
@@ -112,6 +112,7 @@ class PrintQueue {
         segment.translation = text; segment.status = 'ready'; segment.error = null;
         log('translation.completed', { ...context, chars: text.length, ms: Date.now() - started });
       } catch (error) {
+        if (!this.store.data.print_segments.includes(segment)) return;
         segment.status = this.stopping ? 'pending' : 'retrying';
         if (!this.stopping) {
           segment.error = { code: error.code || 'TRANSLATION_UNAVAILABLE', message: error.code?.startsWith('TRANSLATION_') ? error.message : 'Translation is temporarily unavailable' };
@@ -130,7 +131,7 @@ class PrintQueue {
     const request = this.store.data.sessions.find(s => s.id === segment.session_id).requests.find(r => r.id === segment.request_id);
     if (!segment.job_ids.length) {
       const turn = `TURN ${String(segment.turn_number).padStart(4, '0')}\n`;
-      const prefix = segment.role === 'you' ? turn + 'YOU:\n' : (request.local_echo ? turn : '') + 'THEM:\n';
+      const prefix = segment.role === 'you' ? turn + 'YOU:\n' : (request.local_echo ? turn : '') + 'THEY:\n';
       let text = prefix + segment.translation + '\n\n';
       const caps = this.device().capabilities;
       if (!caps.supports_newline) text = text.replace(/\n/g, ' ');
@@ -209,6 +210,20 @@ class PrintQueue {
     if (request.print_job_id === job.id) request.print_job_id = replacement.id;
     this.store.data.jobs.push(replacement); this.changed(replacement); return replacement;
   }
+  clear(reason = 'Stopped by Escape') {
+    clearTimeout(this.timer); this.timer = null;
+    this.controller?.abort(failure('CANCELLED', reason));
+    this.store.data.print_segments = this.store.data.print_segments.filter(s => s.status === 'completed');
+    for (const job of this.store.data.jobs) {
+      if (!['completed', 'delivered', 'abandoned', 'superseded'].includes(job.status)) {
+        job.status = 'abandoned'; job.updated_at = now();
+        job.error = { code: 'CANCELLED', message: reason };
+      }
+    }
+    this.fault = false;
+    this.changed();
+  }
+
   async close() {
     this.stopping = true; clearTimeout(this.timer);
     this.controller?.abort(failure('INTERRUPTED', 'Backend stopped'));
