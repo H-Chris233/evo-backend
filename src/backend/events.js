@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID } = require('node:crypto');
+const { log } = require('./log');
 
 class Events {
   constructor() {
@@ -45,6 +46,7 @@ class Events {
     });
     res.flushHeaders();
     const index = lastId ? channel.history.findIndex(x => x.event.event_id === lastId) : -1;
+    log('sse.connected', { channel: key, replay: index >= 0 });
     if (index >= 0) {
       for (const item of channel.history.slice(index + 1)) this.write(res, item.wire);
     } else {
@@ -56,7 +58,7 @@ class Events {
     channel.clients.add(res);
     const timer = setInterval(() => this.write(res, ': heartbeat\n\n'), 15000);
     timer.unref();
-    res.on('close', () => { clearInterval(timer); channel.clients.delete(res); });
+    res.on('close', () => { clearInterval(timer); channel.clients.delete(res); log('sse.disconnected', { channel: key }); });
   }
 
   close() {

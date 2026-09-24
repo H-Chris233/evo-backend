@@ -42,7 +42,7 @@ async function main() {
     try {
       const snapshot = await api('/heartbeat', {});
       const request = snapshot.latest_request;
-      const failedJob = snapshot.recent_jobs.find(job => job.id === request?.print_job_id && job.status === 'failed');
+      const failedJob = snapshot.current_job?.status === 'unknown' ? snapshot.current_job : null;
       if (request && (request.error || failedJob) && request.request_id !== lastFailure) {
         lastFailure = request.request_id;
         console.error('[simulator] Request ended without printing:', request.error?.code || failedJob.error?.code);
@@ -75,7 +75,7 @@ async function main() {
       if (!command || seen.has(command.job_id)) continue;
       seen.add(command.job_id);
       await api(`/print-jobs/${command.job_id}/events`, { status: 'started' });
-      console.log(`\n[simulated print ${command.job_id}]\n${command.text}\n[/simulated print]\n`);
+      console.log(`\n[simulated print ${command.job_id} | TURN ${command.turn_number} ${command.role.toUpperCase()} ${command.part_index}/${command.part_count}]\n${command.text}\n[/simulated print]\n`);
       await api(`/print-jobs/${command.job_id}/events`, { status: 'completed' });
     }
   } finally { stop(); }

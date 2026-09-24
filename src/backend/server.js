@@ -1,9 +1,11 @@
 'use strict';
 
 const http = require('node:http');
-const { timingSafeEqual } = require('node:crypto');
+const { timingSafeEqual, randomUUID } = require('node:crypto');
 const { Backend, httpError, requireId } = require('./service');
 const { readAudio, transcribeAudio, asrError } = require('./asr');
+const { BoardConnection } = require('./board');
+const { log, errorInfo } = require('./log');
 
 function sameToken(value, expected) {
   const a = Buffer.from(value || '');
@@ -39,10 +41,18 @@ function send(res, status, body) {
 function createBackendServer(config) {
   if (!config.webToken || !config.deviceToken || config.webToken === config.deviceToken) throw new Error('Distinct BACKEND_WEB_TOKEN and BACKEND_DEVICE_TOKEN are required');
   const backend = new Backend(config);
+  if (config.boardHttpUrl) backend.board = new BoardConnection(backend, config);
   let asrController = null;
   let asrWork = null;
   const server = http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
+    const started = Date.now();
+    req.traceId = randomUUID();
+    res.setHeader('X-Request-ID', req.traceId);
+    res.on('finish', () => {
+      if (req.method === 'POST' || res.statusCode >= 400) log('http.completed', { trace_id: req.traceId, method: req.method, path: req.url.split('?')[0], status: res.statusCode, ms: Date.now() - started });
+    });
     handle(req, res).catch(error => {
+      log('http.failed', { trace_id: req.traceId, method: req.method, path: req.url.split('?')[0], status: error.status || 500, ...errorInfo(error) }, 'error');
       if (res.headersSent) return res.destroy();
       // Discard rejected upload bytes without buffering. A mid-upload socket close can hide the HTTP error.
       req.resume();
@@ -86,7 +96,7 @@ function createBackendServer(config) {
       const timer = setTimeout(() => controller.abort(asrError(504, 'ASR_TIMEOUT', 'Speech recognition timed out')), config.asrTimeoutMs);
       try {
         // Audio is kept only for this request; neither recordings nor drafts enter the conversation store.
-        asrWork = (async () => transcribeAudio(config, await readAudio(req, controller.signal), controller.signal))();
+        asrWork = (async () => transcribeAudio(config, await readAudio(req, controller.signal), controller.signal, { trace_id: req.traceId }))();
         return send(res, 200, await asrWork);
       } finally {
         clearTimeout(timer); res.removeListener('close', abort);
@@ -116,6 +126,23 @@ function createBackendServer(config) {
       if (route.length === 2 && req.method === 'GET') { webOnly(); return send(res, 200, backend.deviceSnapshot()); }
       if (route.length === 3 && route[2] === 'events' && req.method === 'GET') {
         webOnly(); return backend.events.subscribe(`device:${deviceId}`, res, req.headers['last-event-id'], backend.deviceSnapshot(), { device_id: deviceId });
+      }
+      if (route.length === 3 && route[2] === 'print-queue' && req.method === 'GET') {
+        webOnly(); return send(res, 200, backend.printing.summary());
+      }
+      if (route.length === 3 && route[2] === 'recover' && req.method === 'POST') {
+        webOnly();
+        const body = await readBody(req);
+        if (Object.keys(body).length) throw httpError(400, 'INVALID_RECOVERY', 'Recovery expects an empty object');
+        if (!backend.board) throw httpError(503, 'BOARD_NOT_CONFIGURED', 'Board adapter is not configured');
+        return send(res, 202, await backend.board.recover());
+      }
+      if (route.length === 5 && route[2] === 'print-jobs' && route[4] === 'resolve' && req.method === 'POST') {
+        webOnly();
+        const body = await readBody(req);
+        if (Object.keys(body).some(key => key !== 'action')) throw httpError(400, 'INVALID_RESOLUTION', 'Only action is accepted');
+        backend.printing.resolve(requireId(route[3], 'job_id'), body.action);
+        return send(res, 200, backend.deviceSnapshot());
       }
       deviceOnly();
       if (req.method === 'POST' && route.length === 3) {
@@ -149,12 +176,14 @@ function createBackendServer(config) {
         server.once('error', reject);
         server.listen(config.port, config.host, () => { server.removeListener('error', reject); resolve(); });
       });
+      backend.board?.start();
       return server.address();
     },
     async close() {
       const closed = new Promise(resolve => server.close(resolve));
       asrController?.abort(asrError(503, 'ASR_CANCELLED', 'Backend stopped'));
       await asrWork?.catch(() => {});
+      await backend.board?.close();
       await backend.close();
       server.closeAllConnections();
       await closed;

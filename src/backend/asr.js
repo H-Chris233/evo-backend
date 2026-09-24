@@ -1,6 +1,7 @@
 'use strict';
 
 const { readLimited } = require('./model');
+const { log, errorInfo } = require('./log');
 
 // Qwen-ASR's compatible API accepts a Data URL, not /audio/transcriptions multipart.
 // https://help.aliyun.com/zh/model-studio/recording-file-recognition-qwen
@@ -35,7 +36,9 @@ async function readAudio(req, signal) {
   return { audio, mime: mime === 'audio/x-wav' ? 'audio/wav' : mime };
 }
 
-async function transcribeAudio(config, { audio, mime }, signal) {
+async function transcribeAudio(config, { audio, mime }, signal, context = {}) {
+  const started = Date.now();
+  log('asr.started', { ...context, model: config.asrModel, bytes: audio.length, mime });
   let response;
   try {
     response = await fetch(config.asrBaseUrl.replace(/\/$/, '') + '/chat/completions', {
@@ -48,6 +51,7 @@ async function transcribeAudio(config, { audio, mime }, signal) {
         asr_options: { enable_itn: false, ...(config.asrLanguage ? { language: config.asrLanguage } : {}) },
       }),
     });
+    log('asr.response', { ...context, status: response.status, ms: Date.now() - started });
     if (!response.ok) {
       await response.body?.cancel();
       const code = [401, 403].includes(response.status) ? 'ASR_AUTH_FAILED'
@@ -63,8 +67,10 @@ async function transcribeAudio(config, { audio, mime }, signal) {
       throw asrError(502, 'ASR_INVALID_RESPONSE', 'Incomplete speech recognition result');
     }
     if (!text.trim()) throw asrError(422, 'ASR_NO_SPEECH', 'No speech was recognized');
+    log('asr.completed', { ...context, chars: text.trim().length, ms: Date.now() - started });
     return { text: text.trim() };
   } catch (error) {
+    log('asr.failed', { ...context, ...errorInfo(signal.aborted ? signal.reason : error), ms: Date.now() - started }, 'warn');
     if (signal.aborted) throw signal.reason;
     if (error.status) throw error;
     throw asrError(502, 'ASR_UNAVAILABLE', 'Could not reach the speech recognition service');

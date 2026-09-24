@@ -4,8 +4,9 @@ const { randomUUID } = require('node:crypto');
 const { Store } = require('./store');
 const { Events } = require('./events');
 const { runAgent, failure } = require('./model');
+const { PrintQueue } = require('./printing');
+const { log, errorInfo } = require('./log');
 
-const ACTIVE_JOBS = new Set(['pending', 'dispatched', 'printing', 'unknown']);
 const now = () => new Date().toISOString();
 const id = () => randomUUID();
 function httpError(status, code, message) { return Object.assign(new Error(message), { status, code }); }
@@ -25,6 +26,12 @@ class Backend {
     this.worker = null;
     this.stopping = false;
     this.waiter = null;
+    this.printing = new PrintQueue(config, this.store, () => this.device, job => {
+      if (job) this.publishDevice('print.updated', job);
+      this.publishDevice();
+      if (this.waiter && this.printAvailable() && this.printing.head()?.status === 'ready' && !['dispatched', 'printing', 'unknown'].includes(this.job()?.status)) this.waiter.finish();
+    });
+    this.printing.wake();
     this.timer = setInterval(() => this.expireDevice(), Math.min(1000, config.offlineMs));
     this.timer.unref();
   }
@@ -46,6 +53,7 @@ class Backend {
     const session = { id: id(), source, created_at: now(), messages: [], requests: [] };
     this.store.data.sessions.push(session);
     this.store.save();
+    log('session.created', { session_id: session.id, source });
     return session;
   }
 
@@ -53,7 +61,7 @@ class Backend {
     return { ...session, agent_state: this.active?.sessionId === session.id ? this.active.state : 'idle' };
   }
 
-  job() { return this.store.data.jobs.find(j => ACTIVE_JOBS.has(j.status)); }
+  job() { return this.printing.currentJob(); }
 
   deviceSnapshot() {
     const device = this.device;
@@ -76,6 +84,8 @@ class Backend {
       } : null,
       input_status_available: !!device.capabilities?.input_events,
       current_job: job || null, recent_jobs: this.store.data.jobs.slice(-6).reverse(),
+      print_queue: this.printing.summary(),
+      board: this.board?.snapshot() || null,
     };
   }
 
@@ -98,17 +108,18 @@ class Backend {
     });
   }
 
-  connect(body) {
+  connect(body, internal = false) {
     this.ready();
+    if (this.config.boardHttpUrl && !internal) throw httpError(409, 'BOARD_CONNECTION_MANAGED', 'The configured board adapter owns this device');
     const caps = body.capabilities;
     if (!caps || typeof caps !== 'object' || Array.isArray(caps)) throw httpError(400, 'INVALID_CAPABILITIES', 'capabilities must be an object');
     const normalized = {};
-    for (const key of ['input_events', 'supports_newline', 'print_started', 'print_completed']) {
+    for (const key of ['input_events', 'supports_newline', 'print_started', 'print_completed', 'print_delivered']) {
       if (caps[key] !== undefined && typeof caps[key] !== 'boolean') throw httpError(400, 'INVALID_CAPABILITIES', `Invalid ${key}`);
       normalized[key] = caps[key] === true;
     }
     if (caps.charset !== undefined && caps.charset !== 'ascii') throw httpError(400, 'INVALID_CAPABILITIES', 'Only printable ASCII is supported');
-    if (caps.max_chars !== undefined && (!Number.isInteger(caps.max_chars) || caps.max_chars < 1 || caps.max_chars > 32000)) throw httpError(400, 'INVALID_CAPABILITIES', 'max_chars must be between 1 and 32000');
+    if (caps.max_chars !== undefined && (!Number.isInteger(caps.max_chars) || caps.max_chars < 1 || caps.max_chars > 262144)) throw httpError(400, 'INVALID_CAPABILITIES', 'max_chars must be between 1 and 262144');
     normalized.charset = caps.charset || null;
     normalized.max_chars = caps.max_chars || null;
     this.loseConnection();
@@ -118,6 +129,7 @@ class Backend {
       id: this.config.deviceId, connection: 'connected', connectionId: id(), lastSeen: Date.now(),
       capabilities: normalized, sessionId: session.id, humanTyping: false,
     };
+    log('device.connected', { device_id: this.device.id, connection_id: this.device.connectionId, capabilities: normalized });
     this.publishDevice();
     return { connection_id: this.device.connectionId, session_id: session.id, heartbeat_interval_ms: this.config.heartbeatMs, device: this.deviceSnapshot() };
   }
@@ -150,15 +162,10 @@ class Backend {
 
   loseConnection() {
     if (this.device.connection !== 'connected') return;
+    log('device.disconnected', { device_id: this.device.id, connection_id: this.device.connectionId, job_id: this.job()?.id }, 'warn');
     this.device.connection = 'disconnected';
     this.device.humanTyping = false;
-    const job = this.job();
-    if (job) {
-      job.status = 'unknown'; job.updated_at = now();
-      job.error = { code: 'DEVICE_DISCONNECTED', message: 'Print result is unknown; automatic delivery is disabled' };
-      this.store.save();
-      this.publishDevice('print.updated', job);
-    }
+    this.printing.disconnect();
     if (this.waiter) this.waiter.finish();
     this.publishDevice();
   }
@@ -173,14 +180,13 @@ class Backend {
     }
     if (!['typing_started', 'typing_stopped'].includes(body.type)) throw httpError(400, 'INVALID_INPUT', 'Expected submit, typing_started or typing_stopped');
     if (!this.device.capabilities.input_events) throw httpError(409, 'INPUT_EVENTS_UNAVAILABLE', 'Device did not advertise input events');
-    if (body.type === 'typing_started' && (this.job() || this.active?.source === 'typewriter')) throw httpError(409, 'DEVICE_BUSY', 'Device is waiting for a reply or printing');
     this.device.humanTyping = body.type === 'typing_started';
     this.device.lastInput = Date.now();
     this.publishDevice();
     return { accepted: true };
   }
 
-  submit(session, body) {
+  submit(session, body, boardInput = null) {
     this.ready();
     if (body.source !== undefined || body.device_id !== undefined) throw httpError(400, 'INVALID_SOURCE', 'Message source is determined by the endpoint');
     requireId(body.client_message_id, 'client_message_id');
@@ -190,22 +196,26 @@ class Backend {
     if (previous) {
       const input = session.messages.find(m => m.id === previous.user_message_id);
       if (input.text !== body.text) throw httpError(409, 'ID_CONFLICT', 'Message ID was already used for different text');
+      log('request.duplicate', { request_id: previous.id, session_id: session.id });
       return { request_id: previous.id, status: previous.status, duplicate: true };
     }
     // ponytail: one global generation slot; use per-session slots when concurrent chats are required.
     if (this.active) throw httpError(409, 'AGENT_BUSY', 'Current reply must finish before sending');
-    if (session.source === 'typewriter' && this.job()) throw httpError(409, 'DEVICE_BUSY', 'Previous print task has not ended');
     if (!this.modelReady()) throw httpError(503, 'MODEL_NOT_CONFIGURED', 'Model service is not configured');
     const request = {
       id: id(), client_message_id: body.client_message_id, user_message_id: id(), status: 'running', created_at: now(), activities: [],
     };
+    if (boardInput) { request.board_request_id = boardInput.requestId; request.local_echo = boardInput.localEcho; }
     session.requests.push(request);
     session.messages.push({ id: request.user_message_id, request_id: request.id, role: 'user', source: session.source, text: body.text, status: 'completed', created_at: now() });
+    this.printing.reserve(session, request);
     this.store.save();
+    log('request.accepted', { request_id: request.id, session_id: session.id, source: session.source, turn: request.turn_number, chars: body.text.length, board_request_id: request.board_request_id });
     const controller = new AbortController();
     this.active = { requestId: request.id, sessionId: session.id, source: session.source, state: 'thinking', controller };
     this.publishSession(session, 'request.accepted', { state: 'thinking', user_message: session.messages.at(-1) }, request.id);
-    if (session.source === 'typewriter') this.publishDevice();
+    this.publishDevice();
+    this.printing.wake();
     // Run after the admission response has been constructed. The busy slot is already held.
     this.worker = Promise.resolve().then(() => this.execute(session, request, body.text, controller));
     return { request_id: request.id, status: 'running', duplicate: false };
@@ -228,6 +238,7 @@ class Backend {
   }
 
   async execute(session, request, text, controller) {
+    const started = Date.now();
     const timer = setTimeout(() => controller.abort(failure('MODEL_TIMEOUT', 'Model request timed out')), this.config.modelTimeoutMs);
     let currentMessage = null;
     let generation = null;
@@ -235,6 +246,7 @@ class Backend {
     const activity = (state, summary) => {
       const item = { id: id(), state, summary, activity_status: 'running', started_at: now() };
       request.activities.push(item);
+      log('activity.started', { request_id: request.id, activity_id: item.id, state });
       this.active.state = state;
       this.publishSession(session, 'activity.started', item, request.id, { activity_id: item.id });
       return item;
@@ -242,25 +254,27 @@ class Backend {
     const finishActivity = (item, result, failed = false) => {
       if (!item || item.activity_status !== 'running') return;
       item.activity_status = failed ? 'failed' : 'completed'; item.ended_at = now();
+      log('activity.ended', { request_id: request.id, activity_id: item.id, state: item.state, outcome: item.activity_status, ms: Date.now() - Date.parse(item.started_at) });
       if (result) item.result = result;
       this.publishSession(session, failed ? 'activity.failed' : 'activity.completed', item, request.id, { activity_id: item.id });
     };
     try {
       generation = activity('thinking', '正在组织回答');
-      const answer = await runAgent({
-        config: this.config, history: this.history(session, request), text, source: session.source,
-        printConstraints: this.device.capabilities, signal: controller.signal,
+      await runAgent({
+        config: this.config, history: this.history(session, request), text, signal: controller.signal, requestId: request.id,
         deviceStatus: () => {
           const snapshot = this.deviceSnapshot();
           // Tool output must not bring device conversation text into web context.
           return {
             device_id: snapshot.device_id, connection: snapshot.connection, business_state: snapshot.business_state,
             print_available: snapshot.print_available,
+            board_state: snapshot.board?.host_state || null, board_error: snapshot.board?.error || null,
             current_print_status: snapshot.current_job?.status || null,
           };
         },
         onText: (round, delta, streaming) => {
           if (!currentMessage) {
+            log('model.first_text', { request_id: request.id, round, ms: Date.now() - started, streaming });
             currentMessage = { id: id(), request_id: request.id, role: 'assistant', text: '', status: 'streaming', created_at: now() };
             session.messages.push(currentMessage);
           }
@@ -295,12 +309,14 @@ class Backend {
       currentMessage.status = 'completed'; currentMessage.kind = 'answer';
       request.status = 'completed'; request.response_message_id = currentMessage.id; request.ended_at = now();
       finishActivity(generation);
+      this.printing.reply(request, currentMessage);
       this.store.save();
       this.publishSession(session, 'message.completed', currentMessage, request.id);
-      if (session.source === 'typewriter') this.createPrint(session, request, answer.text);
       this.publishSession(session, 'request.completed', { ...request, state: 'idle', sources: [] }, request.id);
+      log('request.completed', { request_id: request.id, message_id: currentMessage.id, chars: currentMessage.text.length, ms: Date.now() - started });
     } catch (error) {
       const reason = controller.signal.aborted ? controller.signal.reason : error;
+      log('request.failed', { request_id: request.id, ms: Date.now() - started, ...errorInfo(reason) }, 'error');
       const safe = { code: reason?.code || 'MODEL_ERROR', message: reason?.code ? reason.message : 'The model request failed' };
       if (safe.code.startsWith('MODEL_')) {
         this.modelHealth.available = false; this.modelHealth.last_error = safe;
@@ -308,46 +324,22 @@ class Backend {
       if (currentMessage?.status === 'streaming') currentMessage.status = 'incomplete';
       request.status = safe.code === 'INTERRUPTED' ? 'interrupted' : 'failed'; request.error = safe; request.ended_at = now();
       for (const item of request.activities) finishActivity(item, safe, true);
+      this.printing.reply(request, null);
       try { this.store.save(); } catch { safe.code = 'STORAGE_ERROR'; safe.message = 'Backend storage is unavailable'; }
       this.publishSession(session, 'request.failed', { ...request, state: 'error', partial_message: currentMessage }, request.id);
     } finally {
       clearTimeout(timer);
       this.active = null;
-      if (session.source === 'typewriter') this.publishDevice();
+      this.publishDevice();
+      this.printing.wake();
     }
   }
 
-  printAvailable() {
-    const caps = this.device.capabilities;
-    return this.device.connection === 'connected' && !!(caps?.charset === 'ascii' && caps.max_chars);
-  }
-
-  createPrint(session, request, text) {
-    const caps = this.device.capabilities;
-    let error = null;
-    if (!this.printAvailable()) error = { code: 'PRINT_UNAVAILABLE', message: 'Device is disconnected or print capabilities are missing' };
-    else if (/[^\x20-\x7e\n]/.test(text) || (!caps.supports_newline && text.includes('\n'))) error = { code: 'UNSUPPORTED_TEXT', message: 'Reply contains characters the device cannot print' };
-    else if (text.length > caps.max_chars) error = { code: 'PRINT_TOO_LONG', message: 'Reply exceeds the device character limit' };
-    const job = {
-      id: id(), device_id: this.device.id, session_id: session.id, request_id: request.id,
-      response_message_id: request.response_message_id, text, status: error ? 'failed' : 'pending',
-      error, created_at: now(), updated_at: now(),
-    };
-    this.store.data.jobs.push(job);
-    request.print_job_id = job.id;
-    this.store.save();
-    this.publishDevice('print.updated', job);
-    if (this.waiter) this.waiter.finish();
-  }
+  printAvailable() { return this.printing.available(); }
 
   takeCommand(connectionId) {
     this.checkConnection(connectionId);
-    const job = this.job();
-    if (!job || job.status !== 'pending') return null;
-    job.status = 'dispatched'; job.updated_at = now();
-    this.store.save();
-    this.publishDevice('print.updated', job);
-    return { type: 'print', job_id: job.id, request_id: job.request_id, response_message_id: job.response_message_id, text: job.text };
+    return this.printing.take();
   }
 
   async commands(connectionId, waitMs, signal) {
@@ -371,21 +363,7 @@ class Backend {
 
   printEvent(jobId, body) {
     this.checkConnection(body.connection_id);
-    const job = this.store.data.jobs.find(j => j.id === jobId && j.device_id === this.device.id);
-    if (!job) throw httpError(404, 'JOB_NOT_FOUND', 'Print task not found');
-    if (!['started', 'completed', 'failed'].includes(body.status)) throw httpError(400, 'INVALID_PRINT_EVENT', 'Invalid print status');
-    if (body.status === 'started' && !this.device.capabilities.print_started) throw httpError(409, 'RECEIPT_UNAVAILABLE', 'Start receipts were not advertised');
-    if (body.status === 'completed' && !this.device.capabilities.print_completed) throw httpError(409, 'RECEIPT_UNAVAILABLE', 'Completion receipts were not advertised');
-    if (['completed', 'failed', 'abandoned'].includes(job.status)) return job;
-    if (!['dispatched', 'printing', 'unknown'].includes(job.status)) throw httpError(409, 'JOB_NOT_DISPATCHED', 'Task has not been dispatched');
-    if (body.error !== undefined && (typeof body.error !== 'string' || body.error.length > 300)) throw httpError(400, 'INVALID_PRINT_EVENT', 'Error must be a short string');
-    job.status = body.status === 'started' ? 'printing' : body.status;
-    job.error = body.status === 'failed' ? { code: 'DEVICE_PRINT_FAILED', message: body.error || 'Device reported a print failure' } : null;
-    job.updated_at = now();
-    this.store.save();
-    this.publishDevice('print.updated', job);
-    this.publishDevice();
-    return job;
+    return this.printing.receipt(jobId, body);
   }
 
   async close() {
@@ -393,7 +371,7 @@ class Backend {
     clearInterval(this.timer);
     if (this.waiter) this.waiter.finish();
     this.active?.controller.abort(failure('INTERRUPTED', 'Backend stopped'));
-    await this.worker;
+    await Promise.all([this.worker, this.printing.close()]);
     this.events.close();
   }
 }

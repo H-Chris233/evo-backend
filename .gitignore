@@ -26,7 +26,8 @@ test/tmp/
 # Local identity persistence (device + node)
 .evomap_device_id
 .evomap_node_id
-skills/
+skills/*
+!skills/steve-jobs-skill/
 logs/
 
 # Local triage notes (per-machine, never shipped to public or commits)

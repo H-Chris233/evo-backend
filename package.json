@@ -26,7 +26,7 @@
   "scripts": {
     "backend": "node src/backend/index.js",
     "backend:device": "node scripts/backend-device.js",
-    "test:backend": "node --test test/backend.test.js test/backendAsr.test.js",
+    "test:backend": "node --test test/backend.test.js test/backendAsr.test.js test/backendBoard.test.js",
     "start": "node index.js",
     "run": "node index.js run",
     "solidify": "node index.js solidify",
