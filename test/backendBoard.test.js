@@ -77,12 +77,5 @@ test('actual Python host protocol prints web rounds, receives keyboard input onc
   child.stdin.write(JSON.stringify({ type: 'fault' }) + '\n');
   await eventually(() => app.backend.board.remote?.state === 'fault');
   assert.equal(app.backend.deviceSnapshot().board.error, 'BOARD_DEVICE_FAULT');
-  assert.equal(app.backend.deviceSnapshot().board.serial_connected, true);
-  const recoveryUrl = `http://127.0.0.1:${app.server.address().port}/api/v1/devices/typewriter/recover`;
-  const recover = authorization => fetch(recoveryUrl, { method: 'POST', headers: { Authorization: authorization, 'Content-Type': 'application/json' }, body: '{}' });
-  assert.equal((await recover('Bearer device')).status, 403);
-  assert.equal((await recover('Bearer web')).status, 202);
-  await eventually(() => app.backend.device.connection === 'connected' && app.backend.board.remote?.state === 'editing');
-  assert.equal((await recover('Bearer web')).status, 409);
   assert.equal(errors.split('\n').filter(line => line.trim() && !line.includes('[board.device.recover]')).join('\n'), '');
 });

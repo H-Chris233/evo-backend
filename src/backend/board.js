@@ -24,16 +24,12 @@ class BoardConnection {
     this.inflight = null; this.connectionId = null; this.stopping = false; this.worker = null;
     this.lastError = null; this.nextConnect = 0; this.timer = null; this.controller = new AbortController();
     this.lastStateLog = '';
-    this.hostOnline = false; this.recovering = false;
     backend.store.data.board_inputs ||= [];
   }
   snapshot() {
     return { configured: true, websocket_connected: this.ws?.readyState === WebSocket.OPEN,
       host_state: this.remote?.state || 'disconnected', error: this.remote?.state === 'fault' ? 'BOARD_DEVICE_FAULT' : this.lastError,
-      host_connected: this.hostOnline, serial_connected: this.hostOnline && !!this.remote?.connected,
-      port: this.remote?.port || null, device_name: this.remote?.device || null,
-      device_seen_at: this.remote?.last_device_seen_at || null, device_error: this.remote?.last_error || null,
-      recovery_available: !!this.remote?.safe_recovery, recovering: this.recovering, confirmation: 'software_drain' };
+      confirmation: 'software_drain' };
   }
   start() {
     log('board.started', { http_host: new URL(this.config.boardHttpUrl).host, ws_host: new URL(this.config.boardWsUrl).host, columns: this.config.boardColumns });
@@ -126,15 +122,14 @@ class BoardConnection {
     return result;
   }
   tick() {
-    if (this.worker || this.stopping || this.recovering || this.backend.store.failed) return;
+    if (this.worker || this.stopping || this.backend.store.failed) return;
     this.worker = this.run().catch(error => {
-      this.hostOnline = false;
       if (!this.stopping) { this.fail('BOARD_UNAVAILABLE', errorInfo(error)); this.backend.loseConnection(); this.connectionId = null; }
     }).finally(() => { this.worker = null; });
   }
   async run() {
     this.socket();
-    const state = await this.http('/state'); this.remote = state; this.hostOnline = true;
+    const state = await this.http('/state'); this.remote = state;
     const stateKey = JSON.stringify([state.connected, state.state, state.active_request, state.last_error]);
     if (stateKey !== this.lastStateLog) {
       this.lastStateLog = stateKey;
@@ -217,26 +212,6 @@ class BoardConnection {
     log('board.stopping', { job_id: this.inflight?.jobId });
     this.stopping = true; clearInterval(this.timer); this.controller.abort(); this.ws?.close();
     await this.worker; this.backend.loseConnection();
-  }
-  async recover() {
-    const reject = (status, code, message) => Object.assign(new Error(message), { status, code });
-    if (this.recovering || this.stopping) throw reject(409, 'BOARD_BUSY', 'Board operation in progress');
-    this.recovering = true;
-    try {
-      await this.worker;
-      const state = await this.http('/state'); this.remote = state;
-      if (!state.safe_recovery) throw reject(409, 'BOARD_HOST_UPDATE_REQUIRED', 'Restart the updated board host');
-      if (!state.connected || state.device !== 'kxr530-esp32s3' || !Number.isFinite(state.last_device_seen_at) || Date.now() - state.last_device_seen_at >= 10000) throw reject(503, 'BOARD_NOT_READY', 'Check the serial connection and ESP32');
-      if (state.state !== 'fault' || state.queued_bytes) throw reject(409, 'BOARD_NOT_FAULTED', 'Recovery requires a faulted device with an empty device queue');
-      if (this.inflight) this.fail('BOARD_DEVICE_FAULT');
-      log('board.recover_requested', { port: state.port, state: state.state });
-      await this.http('/device/recover', {});
-      return { accepted: true };
-    } catch (error) {
-      if (error.status) throw error;
-      log('board.recover_failed', errorInfo(error), 'error');
-      throw reject(503, 'BOARD_RECOVER_FAILED', 'Could not confirm the recovery request; inspect board state');
-    } finally { this.recovering = false; this.backend.publishDevice(); }
   }
 }
 

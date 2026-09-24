@@ -130,13 +130,6 @@ function createBackendServer(config) {
       if (route.length === 3 && route[2] === 'print-queue' && req.method === 'GET') {
         webOnly(); return send(res, 200, backend.printing.summary());
       }
-      if (route.length === 3 && route[2] === 'recover' && req.method === 'POST') {
-        webOnly();
-        const body = await readBody(req);
-        if (Object.keys(body).length) throw httpError(400, 'INVALID_RECOVERY', 'Recovery expects an empty object');
-        if (!backend.board) throw httpError(503, 'BOARD_NOT_CONFIGURED', 'Board adapter is not configured');
-        return send(res, 202, await backend.board.recover());
-      }
       if (route.length === 5 && route[2] === 'print-jobs' && route[4] === 'resolve' && req.method === 'POST') {
         webOnly();
         const body = await readBody(req);
