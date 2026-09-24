@@ -1,4 +1,13 @@
-# 后端对话 Agent
+# 数字余生 · 后端开发约定
+
+本仓库以 EvoMap Evolver 为基础改造，但在本黑客松中的产品角色是「数字余生」对话与实体打字机后端。启动入口为 `npm.cmd run backend` 对应的 `src/backend/index.js`；`npm.cmd start` 和仓库里的多语言上游 README 属于继承的 Evolver CLI。修改前阅读本仓库 README 和相关后端模块，不把 Evolver 网络、自演化或 `memory/` 目录写成当前演示已实现的个人记忆能力。
+
+- `src/backend/server.js` 负责 HTTP/SSE 与权限边界，`service.js` 负责会话和设备状态，`model.js` 负责模型与人格，`asr.js` 负责转写，`board.js` 对接相邻 `../board/host`，`printing.js` 负责英文翻译与打印队列。优先在真实共享入口修复问题，复用现有逻辑。
+- 网页会话与实体键盘会话分开；浏览器令牌、设备令牌和供应商密钥只留在服务端。设备失联、部分发送、队列排空和纸面完成需保留各自语义；结果不确定时不能自动重打或声称已完成。
+- 修改跨仓库接口时核对 `../web/server/gateway.js` 允许的路径和 `../board/host` 的协议。模拟设备、测试模型与健康检查只证明对应范围，真实模型、ASR 和硬件需要分别验收。
+- 保留现有未提交修改；只改任务涉及的文件。后端相关测试命令为 `npm.cmd run test:backend`。代码注释沿用附近的英文风格；未要求时不推送或改写 Git 历史。
+
+## 后端对话 Agent
 
 ## 人格来源
 
